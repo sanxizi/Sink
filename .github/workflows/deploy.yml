@@ -1,0 +1,83 @@
+name: Deploy Sink
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - "docs/**"
+      - "tests/**"
+      - "**.md"
+      - ".github/workflows/issue-assistant.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sink-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build & Deploy Cloudflare Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # --- 部署配置覆盖（由 scripts/cloudflare-deploy-config.mjs 消费）---
+      DEPLOY_D1_DATABASE_ID: ${{ secrets.DEPLOY_D1_DATABASE_ID }}
+      DEPLOY_D1_DATABASE_NAME: sink
+      DEPLOY_KV_NAMESPACE_ID: ${{ secrets.DEPLOY_KV_NAMESPACE_ID }}
+      DEPLOY_KV_PREVIEW_NAMESPACE_ID: ${{ secrets.DEPLOY_KV_NAMESPACE_ID }}
+      DEPLOY_ANALYTICS_DATASET: sink
+      # 不设置 DEPLOY_R2_BUCKET_NAME → 生成的部署配置中 R2 绑定会被移除
+      # --- Cloudflare 凭证 ---
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # --- 运行时变量（构建期默认值 + 部署期 Worker vars）---
+      NUXT_SITE_TOKEN: ${{ secrets.NUXT_SITE_TOKEN }}
+      NUXT_CF_ACCOUNT_ID: ${{ secrets.NUXT_CF_ACCOUNT_ID }}
+      NUXT_CF_API_TOKEN: ${{ secrets.NUXT_CF_API_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Generate deploy config
+        run: pnpm deploy:config
+
+      - name: Inject runtime vars into deploy config
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const file = "wrangler.deploy.jsonc";
+            const config = JSON.parse(fs.readFileSync(file, "utf8"));
+            config.vars = {
+              ...(config.vars || {}),
+              NUXT_SITE_TOKEN: process.env.NUXT_SITE_TOKEN,
+              NUXT_CF_ACCOUNT_ID: process.env.NUXT_CF_ACCOUNT_ID,
+              NUXT_CF_API_TOKEN: process.env.NUXT_CF_API_TOKEN,
+            };
+            fs.writeFileSync(file, JSON.stringify(config, null, 2) + "\n");
+            console.log("injected vars:", Object.keys(config.vars).join(", "));
+          '
+
+      - name: Apply D1 migrations
+        run: pnpm wrangler d1 migrations apply DB --remote --config wrangler.deploy.jsonc
+
+      - name: Deploy worker
+        run: pnpm wrangler deploy .output/server/index.mjs --assets .output/public --config wrangler.deploy.jsonc
